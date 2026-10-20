@@ -1,0 +1,3 @@
+[submodule "firnpack"]
+	path = firnpack
+	url = https://github.com/fabzter/firnpack.git
