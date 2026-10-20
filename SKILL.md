@@ -42,9 +42,9 @@ Requires Python 3.13.16+.
 
 ## Process contract
 
-- `--json` on every command except `rename-branch`/`delete-branch`:
-  exactly one JSON object on stdout; human notes on stderr. Parse
-  stdout only.
+- `--json` on every command except `init`, `rename-branch` and
+  `delete-branch`: exactly one JSON object on stdout; human notes on
+  stderr. Parse stdout only.
 - Exit codes: `0` success (incl. explicit no-ops), `1` refused/failed
   (atomic — nothing mutated; merge conflict included), `2` CLI usage
   error, `3` integrity failure.

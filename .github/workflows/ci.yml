@@ -17,9 +17,12 @@ jobs:
           python-version: "3.14"
       - name: root copy is byte-identical to the pinned engine
         run: cmp firnpack.py firnpack/firnpack.py
-      - name: the engine suite passes against the copy
+      - name: skill contract matches the engine surface
         run: |
           python -m pip install pytest
+          python -m pytest tests/ -q
+      - name: the engine suite passes against the copy
+        run: |
           cp firnpack.py firnpack/firnpack.py
           cd firnpack
           python -m pytest tests/ -q
