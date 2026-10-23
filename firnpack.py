@@ -29,13 +29,17 @@ import sys
 import tarfile
 import time
 import zipfile
+import zlib
 from datetime import UTC, datetime
 from pathlib import Path
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 FIRN_DIR = ".firn"
 META_MEMBER = "__firnpack_meta__"
+# a conflict marker line: starts a line (after \n, \r\n or \r, or at the
+# start of the file) with seven < or > characters (SPEC §11)
+_MARKER_LINE = re.compile(rb"(?:\A|[\r\n])(?:<<<<<<<|>>>>>>>)")
 FORMAT_VERSION = 1
 GZIP_LEVEL = 6
 MAX_PATH_WARN = 240
@@ -122,9 +126,24 @@ class DriftError(FirnpackError):
 
 
 class MergeConflict(FirnpackError):
+    """Leftover conflict markers block a commit. `pending_merge` says whether
+    the commit was completing a conflicted merge (the original case) or an
+    ordinary commit (SPEC §9.2: the guard covers every commit)."""
+
+    def __init__(self, paths, *, pending_merge=True):
+        self.paths = paths
+        self.pending_merge = pending_merge
+        what = "merge conflict in" if pending_merge else "conflict markers in"
+        super().__init__(f"{what}: {', '.join(paths)}")
+
+
+class BinaryConflict(FirnpackError):
+    """A merge left a binary file undecided and the commit would keep only
+    OUR version (owner decision 2026-10-23: refuse until the user acts)."""
+
     def __init__(self, paths):
         self.paths = paths
-        super().__init__(f"merge conflict in: {', '.join(paths)}")
+        super().__init__(f"undecided binary conflict in: {', '.join(paths)}")
 
 
 class IntegrityError(FirnpackError):
@@ -179,6 +198,26 @@ def _replace_with_retry(src: Path, dst: Path) -> None:
                     f"please wait a moment and try again."
                 ) from None
             time.sleep(0.2 * (2**attempt))
+
+
+def _symlink(fp: Path, target: str) -> None:
+    """Create a symbolic link, or say plainly why not.
+
+    On Windows creating a link needs Developer Mode or an administrator
+    account; without it the OS refuses with "a required privilege is not
+    held". That is not a disk or sync problem, so it must not be reported
+    as one. (The designed probe-and-flatten flow is deferred past 1.0 —
+    SPEC §5; this only makes the failure honest.)"""
+    try:
+        fp.symlink_to(target)
+    except (OSError, NotImplementedError) as exc:
+        reason = getattr(exc, "strerror", None) or str(exc)
+        raise FirnpackError(
+            f"cannot create the symbolic link {fp.name!r} -> {target!r}: "
+            f"{reason}. On Windows this needs Developer Mode (Settings → "
+            f"Privacy & security → For developers) or an administrator "
+            f"account; otherwise use a machine that allows symbolic links."
+        ) from None
 
 
 _WARNED_PATCH = False
@@ -333,6 +372,24 @@ def _validate_member_names(names: list[str]) -> None:
                 raise IntegrityError(f"reserved device name: {name!r}")
 
 
+def _check_storable(files, symlinks) -> None:
+    """Refuse, at COMMIT, any name the read side would refuse later.
+
+    Shares _validate_member_names so commit and read cannot disagree. Used
+    by both layer writers (_write_layer for commit, _rewrite_layer_from for
+    amend). A name rejected here used to pack fine and then wedge
+    status/verify/export/restore on the committed-but-unreadable layer.
+    """
+    try:
+        if META_MEMBER in (*files, *symlinks):
+            raise IntegrityError(f"reserved member name: {META_MEMBER!r}")
+        _validate_member_names(sorted({*files, *symlinks}))
+    except IntegrityError as exc:
+        raise FirnpackError(
+            f"cannot store {exc.args[0]}; rename the file and try again"
+        ) from None
+
+
 def _validate_member_types(members) -> None:
     """Structural member allowlist (SPEC §5 layer 2)."""
     allowed = {tarfile.REGTYPE, tarfile.AREGTYPE, tarfile.SYMTYPE, tarfile.DIRTYPE}
@@ -342,6 +399,34 @@ def _validate_member_types(members) -> None:
                 f"layer contains a {m.type!r} member ({m.name!r}); "
                 f"hardlinks and special members are not valid in firnpack layers"
             )
+
+
+# Errors that mean "this layer's bytes are damaged or not a tar.gz at all":
+# gzip/zlib faults, a truncated stream (EOFError), tar header faults, and
+# OS-level read failures. All of them must surface as IntegrityError
+# (exit 3), never as a raw traceback.
+_LAYER_DECODE_ERRORS = (tarfile.TarError, zlib.error, EOFError, OSError, ValueError)
+
+
+def _open_layer(path: Path, layer_id: str) -> tarfile.TarFile:
+    """Open a layer as tar.gz, mapping open-time damage to IntegrityError."""
+    try:
+        return tarfile.open(path, "r:gz")  # noqa: SIM115
+    except _LAYER_DECODE_ERRORS as exc:
+        raise IntegrityError(f"cannot open layer {layer_id}: {exc}") from None
+
+
+def _drain_layer(tar: tarfile.TarFile) -> None:
+    """Read the gzip stream to its end so the CRC/ISIZE trailer is checked.
+
+    tarfile stops at the end-of-archive marker and never reads the 8-byte
+    gzip trailer, so a flipped byte in CRC32/ISIZE would otherwise pass.
+    """
+    fileobj = tar.fileobj
+    if fileobj is None:
+        return
+    while fileobj.read(1 << 16):
+        pass
 
 
 # ---------------------------------------------------------------- hashing
@@ -512,26 +597,35 @@ def _layer_id(record: dict) -> str:
 class Repo:
     """The firnpack repository API. The CLI is a thin wrapper over this."""
 
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, recovering: bool = False):
         self.root = root.resolve()
         self.firn = self.root / FIRN_DIR
-        if not (self.firn / "glacier.db").is_file():
+        if not (self.firn / "glacier.db").is_file() and not recovering:
+            # the repo exists (its .firn/ is here) but its index is gone:
+            # point at the rebuild, never at 'init' (which would refuse)
             raise NotARepoError(
-                f"not a firnpack repository: {self.root} (no .firn/ found; "
-                f"run 'firnpack init' first)"
+                f"glacier.db is missing in {self.firn}; run "
+                f"'firnpack verify --rebuild-db' to rebuild the index from "
+                f"the layers"
             )
         self.layers_dir = self.firn / "layers"
         self._db = self._connect()
-        self._cfg = self._load_config()
+        try:
+            self._cfg = self._load_config()
+        except BaseException:
+            self._db.close()
+            raise
 
     # -- lifecycle helpers
 
     @staticmethod
-    def discover(start: Path | None = None) -> Repo:
+    def discover(start: Path | None = None, *, recovering: bool = False) -> Repo:
+        # the nearest .firn/ directory is the repository, even when its
+        # glacier.db is missing: never walk past it into an outer repo
         cur = (start or Path.cwd()).resolve()
         for candidate in [cur, *cur.parents]:
-            if (candidate / FIRN_DIR / "glacier.db").is_file():
-                return Repo(candidate)
+            if (candidate / FIRN_DIR).is_dir():
+                return Repo(candidate, recovering=recovering)
         raise NotARepoError(
             "not a firnpack repository (walked up from "
             f"{cur}; run 'firnpack init' first)"
@@ -551,13 +645,28 @@ class Repo:
                         f"corrupted — try again shortly."
                     ) from None
                 time.sleep(0.5)
-        conn.execute("PRAGMA journal_mode=DELETE")
-        conn.execute("PRAGMA synchronous=FULL")
-        conn.execute("PRAGMA foreign_keys=ON")
+        try:
+            conn.execute("PRAGMA journal_mode=DELETE")
+            conn.execute("PRAGMA synchronous=FULL")
+            conn.execute("PRAGMA foreign_keys=ON")
+        except sqlite3.OperationalError:
+            # lock contention is transient (rc 1, retry); let it propagate
+            conn.close()
+            raise
+        except sqlite3.DatabaseError as exc:
+            # the file is not a SQLite database (or is damaged): this is
+            # store damage, not a usage error — rc 3, one humane line
+            conn.close()
+            raise IntegrityError(
+                f"glacier.db is not a readable firnpack database ({exc}). "
+                f"Save a copy, replace it with an empty file, then run "
+                f"'firnpack verify --rebuild-db' to rebuild the index "
+                f"from the layers"
+            ) from None
         return conn
 
     def _load_config(self) -> configparser.ConfigParser:
-        cfg = configparser.ConfigParser()
+        cfg = configparser.ConfigParser(interpolation=None)
         cfg.read_dict(
             {
                 "user": {"name": getpass.getuser()},
@@ -566,8 +675,48 @@ class Repo:
                 "history": {"reminder_threshold": "50"},
             }
         )
-        cfg.read(self.firn / "config")
+        # init writes this file as UTF-8; read it the same way on every
+        # platform (the locale default would garble a non-ASCII author name)
+        path = self.firn / "config"
+        try:
+            read = cfg.read(path, encoding="utf-8")
+        except (configparser.Error, UnicodeError) as exc:
+            raise FirnpackError(
+                f"cannot read {path}: {exc}. Fix the file, or delete it to "
+                f"fall back to the defaults."
+            ) from None
+        if not read and path.exists():
+            # configparser skips an unreadable file without a word; a user
+            # who set block_unresolved_markers = false must not silently
+            # lose that choice
+            print(
+                f"warning: could not read {path}; using the default settings "
+                f"until it is readable again",
+                file=sys.stderr,
+            )
         return cfg
+
+    @staticmethod
+    def _validate_config(cfg: configparser.ConfigParser, path: Path) -> None:
+        """Reject wrong-typed settings before commit, amend or merge changes
+        anything. Inspection and export do not consume these settings, so
+        opening a repository must not validate them: a typo must not block
+        status, verify or access to the saved files."""
+        typed = (
+            ("history", "reminder_threshold", cfg.getint, "a whole number"),
+            ("merge", "block_unresolved_markers", cfg.getboolean, "true or false"),
+            ("core", "autoname", cfg.getboolean, "true or false"),
+            ("core", "allow_flattened", cfg.getboolean, "true or false"),
+        )
+        for section, key, getter, wanted in typed:
+            try:
+                getter(section, key, fallback=None)
+            except (ValueError, configparser.Error):
+                raise FirnpackError(
+                    f"cannot use {path}: [{section}] {key} = "
+                    f"{cfg.get(section, key, raw=True)!r} is not {wanted}. Fix "
+                    f"that line, or delete the file to fall back to the defaults."
+                ) from None
 
     @property
     def author(self) -> str:
@@ -600,7 +749,7 @@ class Repo:
         )
         db.commit()
         db.close()
-        cfg = configparser.ConfigParser()
+        cfg = configparser.ConfigParser(interpolation=None)
         cfg["user"] = {"name": author or getpass.getuser()}
         cfg["core"] = {"profile": "gzip", "autoname": "true"}
         cfg["merge"] = {"block_unresolved_markers": "true"}
@@ -754,8 +903,11 @@ class Repo:
     def _write_layer(self, layer_id: str, meta: dict, files, symlinks) -> int:
         """Canonical tar -> gzip -> atomic durable write (SPEC §13).
 
-        Returns the compressed size on disk.
+        Returns the compressed size on disk. Names the read side would
+        refuse are rejected here first (see _check_storable): nothing is
+        written, so the repo stays readable.
         """
+        _check_storable(files, symlinks)
         tmp = self.layers_dir / f"{layer_id}.firn.tmp"
         meta_bytes = _canonical_json(meta)
         # Windows carry-forward: load the head manifest ONCE (the caller
@@ -818,53 +970,78 @@ class Repo:
         if not path.is_file():
             raise IntegrityError(f"missing layer file: {path.name}")
         _warn_patch_level_once()
-        try:
-            tar = tarfile.open(path, "r:gz")  # noqa: SIM115
-        except (tarfile.TarError, OSError) as exc:
-            raise IntegrityError(f"cannot open layer {layer_id}: {exc}") from None
-        with tar:
-            members = tar.getmembers()
-            _validate_member_types(members)
-            _validate_member_names([m.name for m in members])
-            meta = None
-            manifest, contents = {}, {}
-            for m in members:
-                if m.name == META_MEMBER:
-                    if m.type not in (tarfile.REGTYPE, tarfile.AREGTYPE):
-                        raise IntegrityError("corrupt meta member")
-                    meta = json.loads(tar.extractfile(m).read().decode("utf-8"))
-                    continue
-                if m.type == tarfile.DIRTYPE:
-                    continue
-                if m.type == tarfile.SYMTYPE:
-                    manifest[m.name] = {
-                        "size": 0,
-                        "mode": m.mode,
-                        "target": m.linkname,
-                    }
-                else:
-                    manifest[m.name] = {
-                        "size": m.size,
-                        "mode": m.mode,
-                        "target": None,
-                    }
-            if meta is None:
-                raise IntegrityError(f"layer {layer_id} has no meta member")
-            return meta, manifest, contents
+        with _open_layer(path, layer_id) as tar:
+            try:
+                members = tar.getmembers()
+                _validate_member_types(members)
+                _validate_member_names([m.name for m in members])
+                meta = None
+                manifest, contents = {}, {}
+                seen = set()
+                for m in members:
+                    if m.name in seen:
+                        raise IntegrityError(
+                            f"layer {layer_id} has a duplicate member {m.name!r}; "
+                            "extraction would keep only one of them"
+                        )
+                    seen.add(m.name)
+                    if m.name == META_MEMBER:
+                        if m.type not in (tarfile.REGTYPE, tarfile.AREGTYPE):
+                            raise IntegrityError("corrupt meta member")
+                        meta = json.loads(tar.extractfile(m).read().decode("utf-8"))
+                        continue
+                    if m.type == tarfile.DIRTYPE:
+                        continue
+                    if m.type == tarfile.SYMTYPE:
+                        manifest[m.name] = {
+                            "size": 0,
+                            "mode": m.mode,
+                            "target": m.linkname,
+                        }
+                    else:
+                        data = tar.extractfile(m).read()
+                        manifest[m.name] = {
+                            "size": m.size,
+                            "mode": m.mode,
+                            "target": None,
+                        }
+                        contents[m.name] = data
+                _drain_layer(tar)
+                # a member may not sit beneath a non-directory member: the
+                # extractor would write through a symlink (d -> ../outside)
+                # or fail mid-write (f0.txt is a file, f0.txt/inner.txt
+                # cannot exist)
+                for name in manifest:
+                    parts = name.split("/")
+                    for i in range(1, len(parts)):
+                        ancestor = "/".join(parts[:i])
+                        if ancestor in manifest:
+                            raise IntegrityError(
+                                f"layer {layer_id}: {name!r} lies beneath "
+                                f"{ancestor!r}, which is not a directory"
+                            )
+            except _LAYER_DECODE_ERRORS as exc:
+                raise IntegrityError(f"layer {layer_id} is damaged: {exc}") from None
+        if meta is None:
+            raise IntegrityError(f"layer {layer_id} has no meta member")
+        return meta, manifest, contents
 
     def _layer_contents(self, layer_id: str, wanted: set[str]) -> dict:
         """Read only the requested regular-file members from a layer."""
         path = self._layer_path(layer_id)
         _warn_patch_level_once()
-        try:
-            tar = tarfile.open(path, "r:gz")  # noqa: SIM115
-        except (tarfile.TarError, OSError) as exc:
-            raise IntegrityError(f"cannot open layer {layer_id}: {exc}") from None
         out = {}
-        with tar:
-            for m in tar.getmembers():
-                if m.name in wanted and m.type in (tarfile.REGTYPE, tarfile.AREGTYPE):
-                    out[m.name] = tar.extractfile(m).read()
+        with _open_layer(path, layer_id) as tar:
+            try:
+                for m in tar.getmembers():
+                    if m.name in wanted and m.type in (
+                        tarfile.REGTYPE,
+                        tarfile.AREGTYPE,
+                    ):
+                        out[m.name] = tar.extractfile(m).read()
+                _drain_layer(tar)
+            except _LAYER_DECODE_ERRORS as exc:
+                raise IntegrityError(f"layer {layer_id} is damaged: {exc}") from None
         return out
 
     # -- merge machinery (SPEC §10/§11)
@@ -963,6 +1140,18 @@ class Repo:
                 merged[path] = (result.encode("utf-8"), None, o[2])
         return merged, conflicts
 
+    def _tree_of(self, layer_id: str) -> dict:
+        """A layer as {path: (bytes|None, target|None, exec_bit)}."""
+        _, manifest, _ = self._read_layer(layer_id)
+        data = self._layer_contents(layer_id, set(manifest))
+        tree = {}
+        for path, v in manifest.items():
+            if v["target"] is not None:
+                tree[path] = (None, v["target"], False)
+            else:
+                tree[path] = (data.get(path, b""), None, v.get("mode") == 0o755)
+        return tree
+
     def merge(self, ref: str, message: str | None = None) -> dict:
         """3-way merge of a branch into the current head (SPEC §10).
 
@@ -970,6 +1159,7 @@ class Repo:
         theirs). Conflicts -> pending-merge state (merge_theirs), markers
         in the worktree, exit path is resolve-then-commit or --abort.
         """
+        self._validate_config(self._cfg, self.firn / "config")
         wt = self._worktree()
         if wt["merge_theirs"] is not None:
             raise FirnpackError(
@@ -992,22 +1182,7 @@ class Repo:
             # head to theirs (or advance the pin), then sync the
             # worktree. One transaction, no switch — switch would move
             # the worktree pointer but never touch branches.head.
-            with self._db:
-                if wt["head_kind"] == "branch":
-                    self._db.execute(
-                        "UPDATE branches SET head = ? WHERE name = ?",
-                        (theirs_id, wt["head_branch"]),
-                    )
-                self._db.execute(
-                    "UPDATE worktree SET head_id = ?, head_pin = ?, "
-                    "updated_at = ? WHERE id = 1",
-                    (
-                        theirs_id,
-                        theirs_id if wt["head_kind"] == "pin" else None,
-                        _utcnow(),
-                    ),
-                )
-            self._sync_worktree_to(theirs_id)
+            self._move_head_and_sync(wt, theirs_id, wt["head_kind"])
             return {
                 "status": "fast_forwarded",
                 "head": theirs_id,
@@ -1016,15 +1191,7 @@ class Repo:
 
         # load the three trees
         def tree_of(layer_id):
-            _, manifest, _ = self._read_layer(layer_id)
-            data = self._layer_contents(layer_id, set(manifest))
-            tree = {}
-            for path, v in manifest.items():
-                if v["target"] is not None:
-                    tree[path] = (None, v["target"], False)
-                else:
-                    tree[path] = (data.get(path, b""), None, v.get("mode") == 0o755)
-            return tree
+            return self._tree_of(layer_id)
 
         base_tree = tree_of(base_id)
         ours_tree = tree_of(ours_id)
@@ -1060,12 +1227,20 @@ class Repo:
                 (theirs_id,),
             )
         self._materialize(merged)  # markers included
-        return {
+        result = {
             "status": "conflict",
             "head": ours_id,
             "theirs": theirs_id,
             "conflicts": conflicts,
         }
+        kept_sides = {
+            path: "theirs" if path not in ours_tree else "ours"
+            for path in conflicts
+            if path not in ours_tree or path not in theirs_tree
+        }
+        if kept_sides:
+            result["kept_sides"] = kept_sides
+        return result
 
     def merge_abort(self) -> dict:
         """Abort a pending merge: rescue any drift (SPEC 9.7 — including
@@ -1145,7 +1320,7 @@ class Repo:
             if target is not None:
                 if fp.exists() or fp.is_symlink():
                     fp.unlink()
-                fp.symlink_to(target)
+                _symlink(fp, target)
                 st = fp.lstat()
                 stats[path] = [st.st_size, st.st_mtime_ns, 0o777]
             else:
@@ -1168,8 +1343,10 @@ class Repo:
         message: str | None = None,
         *,
         allow_markers: bool = False,
+        allow_binary_conflict: bool = False,
         allow_flattened: bool = False,
     ) -> dict:
+        self._validate_config(self._cfg, self.firn / "config")
         wt = self._worktree()
         files, symlinks, ignored, _nested = self._walk()
         entries, stats = self._current_tree(files, symlinks)
@@ -1178,19 +1355,6 @@ class Repo:
         pending_flatten = json.loads(wt["flattened_pending"] or "null")
         merge_theirs = wt["merge_theirs"]
 
-        # Marker guard fires only when completing a pending merge (§9.2).
-        if merge_theirs:
-            marked = self._scan_markers(files)
-            if marked:
-                block = self._cfg.getboolean(
-                    "merge", "block_unresolved_markers", fallback=True
-                )
-                if block and not allow_markers:
-                    raise MergeConflict(marked)
-                print(
-                    f"warning: conflict markers remain in: {', '.join(marked)}",
-                    file=sys.stderr,
-                )
         if pending_flatten:
             block_flat = not allow_flattened and not self._cfg.getboolean(
                 "core", "allow_flattened", fallback=False
@@ -1209,6 +1373,26 @@ class Repo:
                 "layer_id": wt["head_id"],
                 "files": len(files) + len(symlinks),
             }
+
+        # Marker guard (SPEC §9.2/§11; owner decision 2026-10-22: every
+        # commit that would write a layer, not only the one completing a
+        # pending merge). A no-op commit never gets here, so a repository
+        # that already holds marker-shaped lines can still say "nothing to
+        # pack".
+        self._check_markers(
+            entries, allow=allow_markers, pending_merge=bool(merge_theirs)
+        )
+        if merge_theirs:
+            undecided = self._unresolved_binary_conflicts(merge_theirs, entries)
+            if undecided:
+                if not allow_binary_conflict:
+                    raise BinaryConflict(undecided)
+                print(
+                    f"warning: keeping our version of undecided binary "
+                    f"conflict(s): {', '.join(undecided)}; their version is "
+                    f"not included in this merge's tree.",
+                    file=sys.stderr,
+                )
 
         # Path-length warnings (§13): warn past 240, refuse past ustar's 255.
         long_paths = [
@@ -1301,11 +1485,12 @@ class Repo:
         self._maybe_remind(result)
         return result
 
-    def amend(self, message: str | None = None) -> dict:
+    def amend(self, message: str | None = None, *, allow_markers: bool = False) -> dict:
         """Replace the head layer: same parent(s) as head, tree = the
         current worktree (SPEC 9.3). The old layer stays on disk
         (write-once); the head moves. Message-only amend when the tree
         is unchanged. Refuses while a merge is pending."""
+        self._validate_config(self._cfg, self.firn / "config")
         wt = self._worktree()
         if wt["merge_theirs"] is not None:
             raise FirnpackError(
@@ -1329,6 +1514,9 @@ class Repo:
             # = new (or old if -m omitted)") — but identical record
             # (same everything) dedups to the same layer: a no-op amend
             return {"status": "nothing_to_amend", "layer_id": wt["head_id"]}
+
+        # amend writes a layer, so it gets the same marker guard as commit
+        self._check_markers(entries, allow=allow_markers, pending_merge=False)
 
         msg = message if message is not None else old_msg
         record = {
@@ -1376,16 +1564,78 @@ class Repo:
             "replaced": wt["head_id"],
         }
 
+    def _move_head_and_sync(self, wt: dict, layer_id: str, kind: str) -> None:
+        """Move the head (branch head or pin), then sync the worktree.
+        DB-first ordering records the target across a crash. A caught
+        write failure attempts to restore the previous head and files;
+        the error reports whether that rollback succeeded or was partial."""
+        old_head = wt["head_id"]
+        with self._db:
+            if kind == "branch":
+                self._db.execute(
+                    "UPDATE branches SET head = ? WHERE name = ?",
+                    (layer_id, wt["head_branch"]),
+                )
+            self._db.execute(
+                "UPDATE worktree SET head_id = ?, head_pin = ?, "
+                "updated_at = ? WHERE id = 1",
+                (layer_id, layer_id if kind == "pin" else None, _utcnow()),
+            )
+        created_paths: set[str] = set()
+        try:
+            self._sync_worktree_to(layer_id, created_paths=created_paths)
+        except BaseException as exc:
+            note = (
+                "The previous head could not be restored; head and files may "
+                "be partly updated. Run 'firnpack status' and 'firnpack verify'."
+            )
+            try:
+                with self._db:
+                    if kind == "branch":
+                        self._db.execute(
+                            "UPDATE branches SET head = ? WHERE name = ?",
+                            (old_head, wt["head_branch"]),
+                        )
+                    self._db.execute(
+                        "UPDATE worktree SET head_id = ?, head_pin = ?, "
+                        "updated_at = ? WHERE id = 1",
+                        (old_head, old_head if kind == "pin" else None, _utcnow()),
+                    )
+            except Exception:
+                pass  # preserve the original failure, not a rollback error
+            else:
+                try:
+                    # The old stat cache cannot name files newly created by
+                    # the failed rewrite. Remove only those actually attempted,
+                    # not untouched target paths that may hold ignored work.
+                    for path in sorted(created_paths):
+                        fp = self.root / path
+                        if fp.is_symlink() or fp.is_file():
+                            fp.unlink()
+                    self._sync_worktree_to(old_head)
+                except Exception:
+                    note = (
+                        "The head was put back, but files may be partly "
+                        "written. Run 'firnpack status' before continuing."
+                    )
+                else:
+                    note = (
+                        "The head was put back and files were restored to "
+                        "the previous head."
+                    )
+            if isinstance(exc, FirnpackError):
+                exc.args = (f"{exc} {note}",)
+            else:
+                print(f"warning: {note}", file=sys.stderr)
+            raise
+
     def restore(self, ref: str, *, to_dir: str | None = None) -> dict:
         """Extract a layer over the worktree (rescue first if drift),
         or to a directory when --to is given (SPEC 9.7)."""
         wt = self._worktree()
         layer_id = self._resolve_id(ref)
         if to_dir is not None:
-            dest = Path(to_dir)
-            dest.mkdir(parents=True, exist_ok=True)
-            self._extract_layer_to(layer_id, dest)
-            return {"status": "exported", "layer_id": layer_id, "to": str(dest)}
+            return self.export(layer_id, to_dir)
         # over the worktree: rescue drift first (SPEC 9.7)
         if wt["merge_theirs"] is not None:
             raise FirnpackError(
@@ -1429,27 +1679,25 @@ class Repo:
                         size,
                     ),
                 )
-        # move head: branch or pin at the target layer, sync worktree
-        with self._db:
-            if wt["head_kind"] == "branch":
-                self._db.execute(
-                    "UPDATE branches SET head = ? WHERE name = ?",
-                    (layer_id, wt["head_branch"]),
+        # Move the head and sync; failed writes attempt rollback. A rescue
+        # already written above remains recoverable even if the sync fails.
+        kind = wt["head_kind"]
+        try:
+            self._move_head_and_sync(wt, layer_id, kind)
+        except BaseException:
+            if rescue_id is not None:
+                print(
+                    f"warning: your uncommitted work was saved as layer "
+                    f"{rescue_id}; retrieve it with: firnpack export "
+                    f"{rescue_id} --to DIR",
+                    file=sys.stderr,
                 )
-            self._db.execute(
-                "UPDATE worktree SET head_id = ?, head_pin = ?, "
-                "updated_at = ? WHERE id = 1",
-                (
-                    layer_id,
-                    layer_id if wt["head_kind"] == "pin" else None,
-                    _utcnow(),
-                ),
-            )
-        self._sync_worktree_to(layer_id)
+            raise
         return {
             "status": "restored",
             "layer_id": layer_id,
             "rescue_layer": rescue_id,
+            "previous_head": wt["head_id"],
         }
 
     def export(self, ref: str, to_dir: str) -> dict:
@@ -1478,7 +1726,7 @@ class Repo:
             fp = dest / path
             fp.parent.mkdir(parents=True, exist_ok=True)
             if v["target"] is not None:
-                fp.symlink_to(v["target"])
+                _symlink(fp, v["target"])
             else:
                 fp.write_bytes(contents[path])
                 mode = v.get("mode", 0o644)
@@ -1500,11 +1748,11 @@ class Repo:
                 problems.append(f"missing layer file: {layer_id}")
                 continue
             try:
-                meta, manifest, _ = self._read_layer(layer_id)
+                meta, manifest, contents = self._read_layer(layer_id)
             except IntegrityError as exc:
                 problems.append(f"layer {layer_id}: {exc}")
                 continue
-            # rebuild the canonical record and re-hash
+            # rebuild the canonical record and re-hash the layer's own meta
             record = {
                 "format_version": FORMAT_VERSION,
                 "tree_id": meta["tree_id"],
@@ -1519,8 +1767,38 @@ class Repo:
                     f"layer {layer_id}: id mismatch (meta does not hash "
                     f"to the filename)"
                 )
-            if meta["tree_id"] != tree_id:
-                problems.append(f"layer {layer_id}: tree_id mismatch (DB vs meta)")
+            # re-hash the file content: the tree id must equal the hash of
+            # the bytes actually stored, not just the value the meta claims
+            entries = {}
+            for p, v in manifest.items():
+                if v["target"] is not None:
+                    target = v["target"]
+                    entries[p] = (len(target.encode("utf-8")), None, target, False)
+                else:
+                    data = contents[p]
+                    entries[p] = (
+                        len(data),
+                        data,
+                        None,
+                        v["mode"] == 0o755,
+                    )
+            if _hash_tree(entries) != meta["tree_id"]:
+                problems.append(
+                    f"layer {layer_id}: tree_id mismatch (stored bytes do not "
+                    f"hash to the recorded tree)"
+                )
+            # the DB row duplicates the meta record; every column must agree
+            db_row = {
+                "tree_id": tree_id,
+                "parent": parent,
+                "second_parent": second,
+                "message": _message,
+                "author": _author,
+                "created_at": _created,
+            }
+            for column, value in db_row.items():
+                if value != meta[column]:
+                    problems.append(f"layer {layer_id}: {column} mismatch (DB vs meta)")
             if parent is not None and parent not in known:
                 problems.append(f"layer {layer_id}: dangling parent {parent}")
             if second is not None and second not in known:
@@ -1553,7 +1831,12 @@ class Repo:
         (storage.md §6). An empty or table-less database file is
         re-schematized in place; a database file sqlite cannot open
         at all, or a missing one, must be replaced by an empty file
-        first (storage.md §6.4)."""
+        first (storage.md §6, step 4)."""
+        # snapshot the branch names BEFORE the schema heals an empty file:
+        # a missing/empty database has no names to read, so unknowable
+        pre_branches: list[str] | None = None
+        with contextlib.suppress(sqlite3.Error):
+            pre_branches = [n for (n,) in self._db.execute("SELECT name FROM branches")]
         self._db.executescript(SCHEMA)  # idempotent: heals empty/corrupt-empty files
         rows = []
         for path in sorted(self.layers_dir.glob("*.firn")):
@@ -1597,12 +1880,9 @@ class Repo:
                 + ", ".join(m[:12] for m in missing)
                 + " — restore them first (storage.md §6)"
             )
-        lost_branches: list[str] = []
-        with contextlib.suppress(sqlite3.Error):
-            # unreadable branches table: nothing to report as lost
-            lost_branches = [
-                n for (n,) in self._db.execute("SELECT name FROM branches")
-            ]
+        # None = unknowable (missing/empty/unreadable database: no branch
+        # names to read) — distinct from [] (a readable table, none lost)
+        lost_branches: list[str] | None = pre_branches
         head_id = head_tree = None
         if rows:
             # newest TIP layer: one no other layer descends from.
@@ -1633,7 +1913,8 @@ class Repo:
                     "VALUES ('main', ?, ?)",
                     (head_id, _utcnow()),
                 )
-                lost_branches = [b for b in lost_branches if b != "main"]
+                if lost_branches is not None:
+                    lost_branches = [b for b in lost_branches if b != "main"]
                 self._db.execute(
                     "INSERT INTO worktree (id, head_kind, head_branch, "
                     "head_pin, head_id, snapshot, stat_cache, "
@@ -1655,10 +1936,37 @@ class Repo:
             "status": "rebuilt",
             "layers": len(rows),
             "main_head": head_id,
-            "lost_branches": sorted(lost_branches),
+            "lost_branches": (
+                sorted(lost_branches) if lost_branches is not None else None
+            ),
         }
 
     def compact(
+        self,
+        keep: int,
+        *,
+        archive_dir: str | None = None,
+        dry_run: bool = False,
+        yes: bool = False,
+    ) -> dict:
+        """Squash old layers, reclaim disk (SPEC 9.9). See _compact.
+
+        Wrapper guarantee: new layer files are written BEFORE the swap
+        transaction, so a failure anywhere after the first write must
+        not strand them — they have no database row, and an orphan
+        file fails `verify` while nothing else would ever sweep it."""
+        self._compact_wrote = False
+        try:
+            return self._compact(
+                keep, archive_dir=archive_dir, dry_run=dry_run, yes=yes
+            )
+        except BaseException:
+            if self._compact_wrote:
+                with contextlib.suppress(Exception):
+                    self._sweep_orphans()
+            raise
+
+    def _compact(
         self,
         keep: int,
         *,
@@ -1678,7 +1986,9 @@ class Repo:
         Refusals (a history rewrite checks first): pending merge; any
         other branch head or pin reaching into the collapsed set; a
         kept merge layer whose second_parent reaches below the cut.
-        --keep 1 always works (the deep clean).
+        A kept merge whose second parent is collapsed is refused, so
+        --keep 1 is the deep clean only when no kept merge reaches below
+        the cut; otherwise raise --keep until that second parent is kept.
 
         Crash ordering: archive first, then write ALL new layers, then
         ONE DB transaction, then delete old files (both crash windows
@@ -1747,9 +2057,9 @@ class Repo:
             second = all_rows[lid][1]
             if second is not None and second in collapsed:
                 raise FirnpackError(
-                    f"kept layer {lid[:12]} is a merge whose "
-                    f"second_parent falls below the cut — raising --keep "
-                    f"or using --keep 1 keeps the merge structure"
+                    f"kept layer {lid[:12]} is a merge whose second parent "
+                    f"{second[:12]} falls below the cut — raise --keep so the "
+                    f"second parent is kept too"
                 )
         # live roots in old-row space: branch heads outside the
         # deleted set, plus kept merges' second parents (rewritten
@@ -1776,14 +2086,18 @@ class Repo:
             p, s = all_rows[rid]
             if p in collapsed or s in collapsed:
                 who = head_names.get(rid)
-                detail = (
-                    f"branch {who!r} descends from layers that would be collapsed"
-                    if who
-                    else f"layer {rid[:12]} is still referenced, but "
-                    f"its ancestry reaches into the collapsed range"
-                )
+                if who:
+                    raise FirnpackError(
+                        f"branch {who!r} descends from layers that would be "
+                        f"collapsed — raise --keep, or merge/delete the branch first"
+                    )
+                # no branch points here: the reference is structural (a
+                # merge edge or a surviving fork). Deleting a branch cannot
+                # clear it, so do not advise that.
                 raise FirnpackError(
-                    f"{detail} — raise --keep, or merge/delete the branch first"
+                    f"layer {rid[:12]} is still referenced, but its ancestry "
+                    f"reaches into the collapsed range — raise --keep "
+                    f"(a merge edge is cleared only by a higher --keep)"
                 )
         # garbage: UNREACHABLE rows referencing anything that vanishes
         # (deleted chain rows or rewritten survivors) or already-
@@ -1894,15 +2208,21 @@ class Repo:
         fmeta = dict(foundation_record)
         fmeta["layer_id"] = foundation_id
         fmeta["profile"] = "gzip"
-        # copy the cut layer's bytes: the tree is identical; only the
-        # meta differs. Rebuild via _write_layer from the tree.
+        # the foundation's tree IS the cut layer's tree: copy it from
+        # the cut layer itself. _write_layer reads the WORKTREE (which
+        # sits at HEAD, not at the cut) — using it here crashed on any
+        # cut file missing from HEAD and silently gave same-named files
+        # HEAD's bytes in the oldest history.
         cut_files, cut_links = [], []
         for path, v in sorted(cut_manifest.items()):
             if v["target"] is not None:
                 cut_links.append(path)
             else:
                 cut_files.append(path)
-        fsize = self._write_layer(foundation_id, fmeta, cut_files, cut_links)
+        self._compact_wrote = True
+        fsize = self._rewrite_layer_from(
+            cut_id, foundation_id, fmeta, cut_files, cut_links
+        )
 
         # rewrite every layer of the rewrite set onto the foundation:
         # the kept chain first (oldest first), then off-chain
@@ -1911,14 +2231,26 @@ class Repo:
         # reference resolvable as the walk runs
         remap = {cut_id: foundation_id}
         new_rows = []
-        order = list(reversed(kept))
-        placed = set(order) | {cut_id}
-        pending = rewrite_set - placed
+        # topological order over the WHOLE rewrite set (kept chain AND
+        # survivors together): a kept merge layer's second parent can be
+        # an off-chain survivor, which must be rewritten first or the
+        # merge would be re-parented onto an id that is about to be
+        # deleted. Parents/second parents outside the rewrite set are
+        # either the cut (remapped to the foundation) or untouched.
+        order: list[str] = []
+        placed = {cut_id}
+        pending = set(rewrite_set)
         while pending:
             progressed = False
-            for lid in sorted(pending):
+            for lid in sorted(
+                pending, key=lambda x: chain.index(x) if x in chain else -1
+            ):
                 p, s = all_rows[lid]
-                if p in placed and (s is None or s in placed):
+                ready = all(
+                    ref is None or ref in placed or ref not in rewrite_set
+                    for ref in (p, s)
+                )
+                if ready:
                     order.append(lid)
                     placed.add(lid)
                     pending.discard(lid)
@@ -2081,6 +2413,7 @@ class Repo:
         """Write a new layer whose tree equals an existing layer's,
         with new meta. Reads content from the OLD layer, not the
         worktree."""
+        _check_storable(files, links)
         manifest = self._read_layer(old_id)[1]
         regular = {p for p, v in manifest.items() if v["target"] is None}
         contents = self._layer_contents(old_id, regular)
@@ -2136,55 +2469,127 @@ class Repo:
         sign = "+" if delta >= 0 else "-"
         return f"pack {n} files ({sign}{_human(abs(delta))})"
 
-    def _scan_markers(self, files) -> list[str]:
+    def _scan_markers(self, entries) -> list[str]:
+        """Tracked text files holding a line that STARTS with <<<<<<< or
+        >>>>>>> (SPEC §11). Works on the bytes commit() already read for
+        hashing (no second disk pass). A UTF-8 BOM before the first marker
+        is ignored, and only \\n, \\r\\n and \\r end a line: form feeds, NEL
+        and the Unicode line separators inside a line are not line breaks."""
         marked = []
-        for path in files:
-            data = (self.root / path).read_bytes()
-            if b"\0" in data:
-                continue
-            for line in data.decode("utf-8", errors="replace").splitlines():
-                if line.startswith("<<<<<<<") or line.startswith(">>>>>>>"):
-                    marked.append(path)
-                    break
-        return marked
+        for path, (_size, data, _target, _exec) in entries.items():
+            if data is None or b"\0" in data:
+                continue  # symlink or binary
+            if data.startswith(b"\xef\xbb\xbf"):
+                data = data[3:]
+            if _MARKER_LINE.search(data):
+                marked.append(path)
+        return sorted(marked)
+
+    def _check_markers(self, entries, *, allow: bool, pending_merge: bool) -> None:
+        """The unresolved-marker guard shared by commit and amend (SPEC §9.2,
+        §11; owner decision 2026-10-22). Refuse, or warn when allowed."""
+        marked = self._scan_markers(entries)
+        if not marked:
+            return
+        block = self._cfg.getboolean("merge", "block_unresolved_markers", fallback=True)
+        if block and not allow:
+            raise MergeConflict(marked, pending_merge=pending_merge)
+        print(
+            f"warning: conflict markers remain in: {', '.join(marked)}",
+            file=sys.stderr,
+        )
+
+    def _unresolved_binary_conflicts(self, merge_theirs: str, entries) -> list[str]:
+        """Paths of a pending merge whose BINARY conflict nobody has decided:
+        both sides changed the file differently, one of them holds a NUL byte
+        (no text merge exists), and the worktree still holds exactly OUR
+        version. Committing would silently drop theirs (owner decision
+        2026-10-23). Detected from the layers, so no extra state is stored."""
+        head = self._worktree()["head_id"]
+        base_id = self._lca(head, merge_theirs)
+        if base_id is None:
+            return []
+        base = self._tree_of(base_id)
+        ours = self._tree_of(head)
+        theirs = self._tree_of(merge_theirs)
+        undecided = []
+        for path in sorted(set(ours) & set(theirs)):
+            o, t, b = ours[path], theirs[path], base.get(path)
+            if o == t or b in (o, t):
+                continue  # not a both-changed-differently conflict
+            if o[1] is not None or t[1] is not None:
+                continue  # symlinks have their own rule
+            if b"\x00" not in o[0] and b"\x00" not in t[0]:
+                continue  # text: markers or a clean merge, handled elsewhere
+            mine = entries.get(path)
+            if mine is not None and mine[1] == o[0]:
+                undecided.append(path)
+        return undecided
 
     def _maybe_remind(self, result: dict) -> None:
-        threshold = self._cfg.getint("history", "reminder_threshold", fallback=50)
-        count = self._db.execute("SELECT COUNT(*) FROM layers").fetchone()[0]
-        row = self._db.execute(
-            "SELECT value FROM config WHERE key = 'reminder_last_count'"
-        ).fetchone()
-        last = int(row[0]) if row else 0
-        if count >= threshold > last:
-            total = self._db.execute("SELECT SUM(size) FROM layers").fetchone()[0]
-            result["history_reminder"] = {
-                "layers": count,
-                "bytes": total,
-                "hint": "firnpack compact can shrink it",
-            }
-            with self._db:
-                self._db.execute(
-                    "INSERT OR REPLACE INTO config (key, value) "
-                    "VALUES ('reminder_last_count', ?)",
-                    (str(count),),
-                )
+        """The history reminder is a courtesy printed after a commit that has
+        ALREADY landed, so it must never turn that success into a failure."""
+        try:
+            threshold = self._cfg.getint("history", "reminder_threshold", fallback=50)
+            count = self._db.execute("SELECT COUNT(*) FROM layers").fetchone()[0]
+            row = self._db.execute(
+                "SELECT value FROM config WHERE key = 'reminder_last_count'"
+            ).fetchone()
+            last = int(row[0]) if row else 0
+            if count >= threshold > last:
+                total = self._db.execute("SELECT SUM(size) FROM layers").fetchone()[0]
+                result["history_reminder"] = {
+                    "layers": count,
+                    "bytes": total,
+                    "hint": "firnpack compact can shrink it",
+                }
+                with self._db:
+                    self._db.execute(
+                        "INSERT OR REPLACE INTO config (key, value) "
+                        "VALUES ('reminder_last_count', ?)",
+                        (str(count),),
+                    )
+        except (sqlite3.Error, ValueError):
+            result.pop("history_reminder", None)
 
     def _sweep_orphans(self) -> None:
         """Remove crash leftovers: stray .tmp files and layer files with no
-        DB row (SPEC §13). Referenced layers are never touched."""
-        for tmp in self.layers_dir.glob("*.firn.tmp"):
-            with contextlib.suppress(OSError):
+        DB row (SPEC §13). Referenced layers are never touched. A file that
+        cannot be removed (locked by OneDrive or antivirus) is reported on
+        stderr rather than silently kept; the next commit, amend or compact
+        tries again."""
+        stuck: list[str] = []
+        for tmp in list(self.layers_dir.glob("*.tmp")):
+            try:
                 tmp.unlink()
+            except OSError:
+                stuck.append(tmp.name)
         known = {row[0] for row in self._db.execute("SELECT id FROM layers")}
-        for layer_file in self.layers_dir.glob("*.firn"):
+        for layer_file in list(self.layers_dir.glob("*.firn")):
             if layer_file.stem not in known:
-                with contextlib.suppress(OSError):
+                try:
                     layer_file.unlink()
+                except OSError:
+                    stuck.append(layer_file.name)
+        if stuck:
+            print(
+                f"warning: could not remove leftover file(s) in "
+                f"{self.layers_dir}: {', '.join(sorted(stuck))} (they are not "
+                f"part of your history; the next commit, amend or compact "
+                f"will try again)",
+                file=sys.stderr,
+            )
 
     def status(self, *, full: bool = False, list_ignored: bool = False) -> dict:
         files, symlinks, ignored, nested = self._walk()
         wt = self._worktree()
         cache = json.loads(wt["stat_cache"] or "{}")
+        if wt["merge_theirs"] is not None:
+            # Mid-merge the stat cache describes the files the merge itself
+            # just wrote (markers included), so the fast path would call a
+            # half-resolved worktree "clean". Drift is measured against the
+            # head layer (docs/usage.md), so rehash everything.
+            full = True
 
         head_manifest = {}
         if wt["head_id"]:
@@ -2322,7 +2727,29 @@ class Repo:
                 raise FirnpackError(
                     f"layer id prefix {ref!r} is ambiguous ({len(matches)} matches)"
                 )
+        if ref and len(ref) < 6 and all(c in "0123456789abcdef" for c in ref):
+            raise FirnpackError(
+                f"no branch named {ref!r}, and as a layer id it is too short "
+                f"(use at least 6 hex characters)"
+            )
         raise FirnpackError(f"no branch or layer named {ref!r}")
+
+    def _reachable(self, starts) -> set[str]:
+        """Every layer reachable from `starts` through parent and
+        second_parent links (the starts themselves included)."""
+        links = {
+            r[0]: (r[1], r[2])
+            for r in self._db.execute("SELECT id, parent, second_parent FROM layers")
+        }
+        seen: set[str] = set()
+        stack = [s for s in starts if s]
+        while stack:
+            lid = stack.pop()
+            if lid in seen:
+                continue
+            seen.add(lid)
+            stack.extend(p for p in links.get(lid, ()) if p)
+        return seen
 
     def branch(self, name: str, from_ref: str | None = None) -> dict:
         """Create a branch at HEAD (or at from_ref: branch name or id
@@ -2393,7 +2820,9 @@ class Repo:
             self._sync_worktree_to(layer_id)
         return {"ref": ref, "kind": kind, "head": layer_id}
 
-    def _sync_worktree_to(self, layer_id: str) -> None:
+    def _sync_worktree_to(
+        self, layer_id: str, *, created_paths: set[str] | None = None
+    ) -> None:
         """Extract the layer's tree into the worktree and refresh the
         snapshot/stat cache. M1 scope: files+symlinks replaced wholesale.
 
@@ -2416,11 +2845,13 @@ class Repo:
         for path in sorted(manifest):
             v = manifest[path]
             fp = self.root / path
+            if created_paths is not None and not os.path.lexists(fp):
+                created_paths.add(path)
             fp.parent.mkdir(parents=True, exist_ok=True)
             if v["target"] is not None:
                 if fp.exists() or fp.is_symlink():
                     fp.unlink()
-                fp.symlink_to(v["target"])
+                _symlink(fp, v["target"])
                 st = fp.lstat()
                 stats[path] = [st.st_size, st.st_mtime_ns, 0o777]
                 entries[path] = (
@@ -2594,7 +3025,19 @@ def _cmd_commit(args) -> int:
             args.message,
             allow_markers=args.allow_markers,
             allow_flattened=args.allow_flattened,
+            allow_binary_conflict=args.allow_binary_conflict,
         )
+    except (MergeConflict, BinaryConflict) as exc:
+        if args.json:
+            # SPEC §9.2: the refusal is machine-readable too; the humane
+            # sentence still goes to stderr via main()
+            key = (
+                "blocked_by_binary_conflict"
+                if isinstance(exc, BinaryConflict)
+                else "blocked_by_markers"
+            )
+            print(json.dumps({"status": key, key: exc.paths}, indent=2))
+        raise
     finally:
         repo.close()
     if args.json:
@@ -2668,6 +3111,7 @@ def _cmd_history(args) -> int:
             f"{' ' + tips if tips else ''}{merge}"
         )
         print(f"    {c['message']}")
+    return 0
 
 
 def _cmd_diff(args) -> int:
@@ -2693,7 +3137,12 @@ def _cmd_diff(args) -> int:
 def _cmd_amend(args) -> int:
     repo = Repo.discover()
     try:
-        result = repo.amend(args.message)
+        result = repo.amend(args.message, allow_markers=args.allow_markers)
+    except MergeConflict as exc:
+        if args.json:
+            payload = {"status": "blocked_by_markers", "blocked_by_markers": exc.paths}
+            print(json.dumps(payload, indent=2))
+        raise
     finally:
         repo.close()
     if args.json:
@@ -2722,6 +3171,12 @@ def _cmd_restore(args) -> int:
         return 0
     rescue = result.get("rescue_layer")
     print(f"restored layer {result['layer_id'][:12]} into the worktree")
+    prev = result.get("previous_head")
+    if prev and prev != result["layer_id"]:
+        print(
+            f"the head moved from {prev[:12]} to {result['layer_id'][:12]}; "
+            f"to come back: firnpack restore {prev[:12]}"
+        )
     if rescue:
         print(
             f"your uncommitted work was saved as layer {rescue[:12]} "
@@ -2744,7 +3199,7 @@ def _cmd_export(args) -> int:
 
 
 def _cmd_verify(args) -> int:
-    repo = Repo.discover()
+    repo = Repo.discover(recovering=bool(args.rebuild_db))
     try:
         if args.rebuild_db:
             rebuilt = repo.rebuild_db()
@@ -2757,10 +3212,15 @@ def _cmd_verify(args) -> int:
                 f"rebuilt database from {rebuilt['layers']} layer(s); "
                 f"main at {head[:12] if head else '(no layers)'}"
             )
-            if rebuilt["lost_branches"]:
+            lost = rebuilt["lost_branches"]
+            if lost is None:
                 print(
-                    "lost (branch names live only in the database): "
-                    + ", ".join(rebuilt["lost_branches"])
+                    "lost branches: unknown — the database was missing or "
+                    "empty, so branch names could not be recovered"
+                )
+            elif lost:
+                print(
+                    "lost (branch names live only in the database): " + ", ".join(lost)
                 )
             print(
                 f"verify ok — {verify_result['layers']} layers re-hashed and consistent"
@@ -2846,9 +3306,17 @@ def _cmd_merge(args) -> int:
             return 1
         else:
             result = repo.merge(args.ref, args.message)
-    except MergeConflict:
-        # merge() reports conflicts in its result dict, not via the
-        # exception — this except is defensive only
+    except MergeConflict as exc:
+        # A clean three-way result can still contain marker-shaped text.
+        # commit() leaves the merge pending; report the same JSON refusal
+        # as an explicit commit, then let main() print the human sentence.
+        if args.json:
+            print(
+                json.dumps(
+                    {"status": "blocked_by_markers", "blocked_by_markers": exc.paths},
+                    indent=2,
+                )
+            )
         raise
     finally:
         repo.close()
@@ -2887,10 +3355,19 @@ def _cmd_merge(args) -> int:
             file=sys.stderr,
         )
         for path in result["conflicts"]:
-            print(f"  {path}", file=sys.stderr)
+            kept = result.get("kept_sides", {}).get(path)
+            detail = f" (kept modified side: {kept})" if kept else ""
+            print(f"  {path}{detail}", file=sys.stderr)
         print(
-            "fix the marked files (<<<<<<< ... >>>>>>>), then commit. "
-            "Or: firnpack merge --abort",
+            f"source layers: ours {result['head']}, theirs {result['theirs']}. "
+            f"Inspect either with: firnpack export <layer-id> --to DIR",
+            file=sys.stderr,
+        )
+        print(
+            "resolve the listed files, then commit: text conflicts have "
+            "markers (<<<<<<< ... >>>>>>>); binary conflicts keep ours "
+            "(replace the file, or use commit --allow-binary-conflict to "
+            "keep ours on purpose). Or: firnpack merge --abort",
             file=sys.stderr,
         )
         return 1
@@ -3002,9 +3479,22 @@ def _cmd_delete_branch(args) -> int:
             return 1
         with repo._db:
             repo._db.execute("DELETE FROM branches WHERE name = ?", (args.name,))
+        remaining = [h for (h,) in repo._db.execute("SELECT head FROM branches")]
+        remaining += [x for x in (wt["head_id"], wt["merge_theirs"]) if x]
+        stranded = row[0] not in repo._reachable(remaining)
     finally:
         repo.close()
     print(f"deleted branch {args.name} (layers remain on disk)")
+    if stranded:
+        # documented in SPEC §9.4 / usage: deleting is allowed, silently
+        # stranding work is not
+        print(
+            f"warning: layer {row[0][:12]} (the tip of {args.name!r}) is no "
+            f"longer reachable from any branch or from where you are now. It "
+            f"stays on disk until a compact. To keep it: "
+            f"firnpack branch {args.name} {row[0][:12]}",
+            file=sys.stderr,
+        )
     return 0
 
 
@@ -3034,6 +3524,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-flattened",
         action="store_true",
         help="confirm storing flattened symlinks as files",
+    )
+    p_commit.add_argument(
+        "--allow-binary-conflict",
+        action="store_true",
+        help="finish a merge keeping YOUR version of an undecided binary file",
     )
     p_commit.add_argument("--json", action="store_true")
     p_commit.set_defaults(func=_cmd_commit)
@@ -3068,6 +3563,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_amend = sub.add_parser("amend", help="replace the head layer")
     p_amend.add_argument("-m", "--message", default=None)
+    p_amend.add_argument(
+        "--allow-markers",
+        action="store_true",
+        help="amend despite leftover conflict markers",
+    )
     p_amend.add_argument("--json", action="store_true")
     p_amend.set_defaults(func=_cmd_amend)
 
@@ -3147,12 +3647,32 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     try:
         return args.func(args)
-    except MergeConflict as exc:
+    except BinaryConflict as exc:
         print(
-            f"firnpack: merge conflict — resolve these files first: "
-            f"{', '.join(exc.paths)}",
+            f"firnpack: the merge left a binary file undecided: "
+            f"{', '.join(exc.paths)}. Committing now would silently keep YOUR "
+            f"version and drop theirs. Copy theirs in first (firnpack export "
+            f"<their branch> --to DIR, then copy the file over), or commit "
+            f"anyway on purpose with --allow-binary-conflict, or give up "
+            f"with 'firnpack merge --abort'.",
             file=sys.stderr,
         )
+        return 1
+    except MergeConflict as exc:
+        if exc.pending_merge:
+            print(
+                f"firnpack: merge conflict — resolve these files first: "
+                f"{', '.join(exc.paths)}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"firnpack: conflict markers (<<<<<<< / >>>>>>>) are still in: "
+                f"{', '.join(exc.paths)}. Remove them and commit again, or "
+                f"commit anyway with --allow-markers (or set [merge] "
+                f"block_unresolved_markers = false in .firn/config).",
+                file=sys.stderr,
+            )
         return 1
     except DriftError as exc:
         print(f"firnpack: {exc}", file=sys.stderr)
@@ -3162,6 +3682,51 @@ def main(argv=None) -> int:
         return 3
     except FirnpackError as exc:
         print(f"firnpack: {exc}", file=sys.stderr)
+        return 1
+    except BrokenPipeError:
+        # `firnpack history | head -1`: the reader left, which is not an
+        # error. Point stdout at the null device so the interpreter's
+        # shutdown flush cannot raise again, and leave quietly.
+        with contextlib.suppress(Exception):
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        return 0
+    except sqlite3.OperationalError as exc:
+        text = str(exc)
+        if "no such table" in text or "no such column" in text:
+            # an empty or half-written database: store damage, not contention
+            print(
+                f"firnpack: integrity failure: glacier.db looks damaged "
+                f"({text}); run 'firnpack verify --rebuild-db' to rebuild "
+                f"the index from the layers",
+                file=sys.stderr,
+            )
+            return 3
+        print(
+            f"firnpack: the database could not be used ({text}). If another "
+            f"firnpack command, OneDrive or antivirus has it open, wait a "
+            f"moment and try again; run 'firnpack verify' if in doubt.",
+            file=sys.stderr,
+        )
+        return 1
+    except sqlite3.DatabaseError as exc:
+        print(
+            f"firnpack: integrity failure: glacier.db looks damaged ({exc}); "
+            f"run 'firnpack verify --rebuild-db' to rebuild the index from "
+            f"the layers",
+            file=sys.stderr,
+        )
+        return 3
+    except OSError as exc:
+        # a full disk, a read-only folder, a file held by OneDrive or
+        # antivirus: one plain sentence naming the file, never a traceback
+        where = f" ({exc.filename})" if exc.filename else ""
+        print(
+            f"firnpack: file system error: {exc.strerror or exc}{where}. "
+            f"Check that the disk has free space and that no other program "
+            f"(OneDrive, antivirus) is holding the file, then try again. "
+            f"Run 'firnpack verify' to confirm your history is intact.",
+            file=sys.stderr,
+        )
         return 1
 
 
