@@ -378,7 +378,7 @@ def test_skill_documents_noop_and_recovery_limits():
     match = re.search(r"`\{status: nothing_to_pack, ([^}]+)\}`", daily)
     assert match, "SKILL.md must distinguish the no-op commit JSON shape"
     assert {key.strip() for key in match[1].split(",")} == {"layer_id", "files"}
-    assert "no normal 1.0.1 command creates that pending state" in daily
+    assert "no normal command creates that pending state" in daily
     undo = skill.split("### Undo, rescue, explore", 1)[1].split(
         "### Integrity and recovery", 1
     )[0]

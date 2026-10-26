@@ -61,8 +61,8 @@ Requires Python 3.13.16+.
   checks for `commit`, `amend`, `merge`, `switch` and `compact` precede
   those commands' data writes. But a `conflict` or marker-blocked
   `merge` leaves materialized files and durable pending state; failed
-  `restore` and fast-forward `merge` attempt rollback and report its
-  outcome; an I/O failure can leave partial writes. Database rebuild
+  `restore`, `switch` and fast-forward `merge` attempt rollback and report
+  its outcome; an I/O failure can leave partial writes. Database rebuild
   can initialize schema even when later integrity checks fail. Read
   the command's contract and recovery message.
 - Read-only forms: `status`, `history`, `diff`, `verify` without
@@ -99,6 +99,8 @@ second_parent, message, author, created_at, tips[]}], count}`; diff:
 
 Tracking honors the root `.gitignore` only; nested ones are reported,
 not applied. `.git/` directories and the top-level `.firn/` are never packed.
+`status --json` always includes the sorted `ignored` list; `--ignored`
+controls the human-readable listing.
 
 `commit` guards every commit that would write a layer (a no-op still
 says `nothing_to_pack`):
@@ -124,7 +126,7 @@ says `nothing_to_pack`):
 
 Symlink flattening is deferred past 1.0. The `flattened_pending` status
 field, `--allow-flattened` flag and `core.allow_flattened` setting are
-reserved; no normal 1.0.1 command creates that pending state.
+reserved; no normal command creates that pending state.
 
 ### Branching
 
@@ -143,6 +145,10 @@ compact; re-attach with `branch NAME <id>`. Merge refuses on drift or
 pending merge; clean merge = one layer with two parents; conflict =
 git-style markers in text files + durable pending state
 (`status.merge_pending`).
+
+While a merge is pending, `branch`, `switch`, `restore` without `--to`,
+`amend`, another `merge`, and `compact` refuse. Inspection, export and
+`restore --to` remain usable; resolve and `commit`, or `merge --abort`.
 
 JSON — branch: `{name, head, created}`; switch: `{ref, kind: branch|pin,
 head}`; list-branches: `{branches: [{name, head, created_at, current}]}`;
@@ -185,19 +191,26 @@ come back" is `restore <previous_head>`. If the file rewrite fails,
 restore attempts to put the previous head and files back and the error
 says whether rollback succeeded or files may be partly written; a
 rescue layer already saved is still named with its export command.
+Target leaves and ancestors are checked before worktree deletion:
+ignored content and unrescued new obstructions are never silently
+overwritten. Clean tracked file↔directory transitions are supported.
+An exclusive-create collision preserves the occupying entry; rollback
+then reports partial filesystem recovery instead of deleting that entry.
 A failed `export`/`restore --to` can leave a partially extracted
 destination. Symlinks a platform cannot create (e.g. Windows without
 Developer Mode) stop `restore`, `export` and `merge` at the first link
-with a plain exit 1. Restore and fast-forward merge attempt rollback;
+with a plain exit 1. Restore, switch and fast-forward merge attempt rollback;
 a non-fast-forward merge leaves pending state and possibly partial files
 for `merge --abort`. The designed `--flatten-symlinks` opt-in is deferred
 past 1.0.
 
-JSON — amend: `{status: amended, layer_id, replaced}` |
+JSON — amend: `{status: amended, layer_id, replaced, [maxpath_warning]}` |
 `{status: nothing_to_amend, layer_id}` | `{status: blocked_by_markers,
 blocked_by_markers: [paths]}` (exit 1); restore: `{status: restored,
 layer_id, rescue_layer, previous_head}` | `{status: exported, layer_id,
 to}`; export: `{status: exported, layer_id, to}`.
+`amend` uses commit's 255-character stored-path limit and optional
+`maxpath_warning` for full paths longer than 240 characters.
 
 ### Integrity and recovery
 
@@ -243,6 +256,12 @@ passes through collapsed layers (the message names the branch when one
 points there — raise `--keep` or merge/delete it; a bare merge edge is
 cleared only by a higher `--keep`); a kept merge whose second parent
 falls below the cut. Peak-disk need is checked up front.
+
+`--archive` must be outside `.firn/`, including symlink aliases; invalid
+placement refuses even a preview or no-op. Archives use exclusive-create
+names with collision suffixes, never overwrite an existing file, and
+finish before history rewrites. If a later rewrite fails, stderr names
+the completed archive. Space checks include the archive destination.
 
 Agent procedure: (1) `--dry-run --json`; present the plan; (2) obtain
 human `--keep`/`--yes`/optional `--archive`; (3) execute; (4) report
