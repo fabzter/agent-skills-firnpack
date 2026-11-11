@@ -33,7 +33,9 @@ Requires Python 3.13.16+.
 3. **Never silent.** Surface these when present: `branches_remapped`,
    `off_chain_rewritten`, `garbage_collected`, `rescue_layer`,
    `history_reminder`, `maxpath_warning`, `flattened_pending`,
-   `nested_gitignore`, `ignored_count`.
+   `nested_gitignore`, `ignored_count`, and `tarfile_patch_warning`
+   (extraction JSON on interpreters where the tarfile patch-level
+   warning fires).
 4. **Verify after external events** (copy, power loss, old clone):
    `verify`. Exit 3 = stop writing; follow Recovery below.
 5. **Ids are opaque 40-hex content hashes.** Prefixes of at least 6
@@ -142,7 +144,10 @@ tells you which world you are in). `delete-branch` refuses the current
 branch and warns on stderr when the deleted tip is left unreachable
 from every branch and from where you are — it stays on disk until a
 compact; re-attach with `branch NAME <id>`. Merge refuses on drift or
-pending merge; clean merge = one layer with two parents; conflict =
+pending merge, and on histories that share no common ancestor (exit 1,
+"share no common ancestor" — a refusal, not corruption: `verify` stays
+green; export one side and combine manually). Clean merge = one layer
+with two parents; conflict =
 git-style markers in text files + durable pending state
 (`status.merge_pending`).
 
@@ -285,6 +290,7 @@ garbage_collected, branches_remapped, new_head, archive}`; idle:
 | 1 | drift / "uncommitted" | commit or rescue the drift; never discard for the user |
 | 1 | "merge is pending" | resolve + commit, or `merge --abort` |
 | 1 | `status: "conflict"` | conflict protocol above |
+| 1 | "share no common ancestor" | disconnected histories (e.g. an amended root): NOT corruption — `verify` stays green; export one side and combine manually, or re-create the branch from a shared layer |
 | 1 | `status: "blocked_by_markers"` | remove the markers and commit again; `--allow-markers` only when the human insists |
 | 1 | `status: "blocked_by_binary_conflict"` | decide content with the human, `merge --abort`, or `--allow-binary-conflict` when the human says keep ours |
 | 1 | compact refusal naming a branch/pin | raise `--keep` or merge/delete; re-plan (a "still referenced" edge = raise `--keep` only) |
@@ -310,7 +316,9 @@ defaults. `user.name` is the author; `history.reminder_threshold`
 
 ## Recovery
 
-1. `verify` — read the problem list.
+1. `verify` — read the problem list (it re-hashes every layer against its
+   filename and cross-checks the in-band meta, including `layer_id` and
+   `profile`, against the database).
 2. Missing layer file: drop a copy (backup, archive zip, other machine)
    into `layers/` under its id; `verify` confirms.
 3. Orphan `.firn` files with no DB row are listed by `verify`; stray
